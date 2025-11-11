@@ -1,91 +1,127 @@
 import requests
 import pandas as pd
-from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
-import datetime
+from datetime import datetime
+import json
+import time
 
-# ========== CONFIG ==========
-API_KEY = "YOUR_DATAGOLF_API_KEY"   # Replace with your key
-TOUR = "pga"
-N_WEEKS_HISTORY = 52  # 1 year of data
+# ==========================
+# CONFIG
+# ==========================
+API_KEY = "d1dbe0ad91msh9508fe05e250a69p140593jsn26c5239accb7"
+HOST = "live-golf-data.p.rapidapi.com"
+ORG_ID = "1"     # PGA Tour
+YEAR = "2024"
 
-# ========== STEP 1: FETCH HISTORICAL RESULTS ==========
-print("Fetching historical tournament results...")
-url_results = f"https://feeds.datagolf.com/preds/historical?tour={TOUR}&key={API_KEY}"
-results = requests.get(url_results).json()
-results_df = pd.DataFrame(results["predictions"])
+headers = {
+    "x-rapidapi-key": API_KEY,
+    "x-rapidapi-host": HOST
+}
 
-# ========== STEP 2: FETCH PLAYER STATS ==========
-print("Fetching player stats...")
-url_stats = f"https://feeds.datagolf.com/stats/players?tour={TOUR}&key={API_KEY}"
-stats = requests.get(url_stats).json()
-stats_df = pd.DataFrame(stats["stats"])
+# ==========================
+# HELPER FUNCTION
+# ==========================
+def get_json(endpoint, params=None):
+    """Fetch data and handle errors gracefully"""
+    url = f"https://{HOST}/{endpoint}"
+    res = requests.get(url, headers=headers, params=params)
+    if res.status_code != 200:
+        print(f"❌ Error {res.status_code}: {endpoint} → {res.text}")
+        return None
+    try:
+        return res.json()
+    except Exception:
+        return None
 
-# ========== STEP 3: FETCH WORLD RANKINGS ==========
-print("Fetching world rankings...")
-url_rank = f"https://feeds.datagolf.com/owgr?key={API_KEY}"
-rank = requests.get(url_rank).json()
-rank_df = pd.DataFrame(rank["rankings"])
 
-# ========== STEP 4: MERGE & CLEAN ==========
-print("Merging datasets...")
-df = (
-    results_df.merge(stats_df, on="player_name", how="left")
-              .merge(rank_df, on="player_name", how="left")
-)
+# ==========================
+# STEP 1: WORLD RANKINGS
+# ==========================
+print("🌍 Fetching World Rankings (statId=186)...")
+world_data = get_json("stats", {"year": YEAR, "statId": "186"})
+world_df = pd.DataFrame(world_data.get("rows", [])) if world_data else pd.DataFrame()
+world_df.rename(columns={"playerName": "name", "rank": "world_rank"}, inplace=True)
+print(f"✅ World rankings loaded: {len(world_df)} players")
 
-# Basic cleaning
-df = df.fillna(0)
-df["winner"] = (df["finish_position"] == 1).astype(int)
 
-# Create "recent form" feature (average finish over last 5 events)
-df = df.sort_values(["player_name", "date"])
-df["recent_form"] = df.groupby("player_name")["finish_position"].rolling(5, min_periods=1).mean().reset_index(level=0, drop=True)
-df["recent_form"] = 1 / df["recent_form"]  # lower finish = higher form
+# ==========================
+# STEP 2: TOURNAMENT DETAILS
+# ==========================
+print("📅 Fetching tournament info (Valspar Championship example)...")
+tournament_data = get_json("tournament", {"orgId": ORG_ID, "tournId": "475", "year": YEAR})
+tourn_df = pd.DataFrame([tournament_data]) if tournament_data else pd.DataFrame()
+tourn_df["tournId"] = tournament_data.get("tournId") if tournament_data else None
+print("✅ Tournament info fetched.")
 
-# Features
-features = [
-    "owgr_rank",
-    "strokes_gained_total",
-    "strokes_gained_putting",
-    "strokes_gained_off_tee",
-    "strokes_gained_approach",
-    "recent_form"
-]
-df = df.dropna(subset=["winner"])
 
-# ========== STEP 5: TRAIN MODEL ==========
-print("Training model...")
-X = df[features].fillna(0)
-y = df["winner"]
+# ==========================
+# STEP 3: LEADERBOARD
+# ==========================
+print("🏆 Fetching leaderboard...")
+leaderboard_data = get_json("leaderboard", {"orgId": ORG_ID, "tournId": "475", "year": YEAR})
+leaderboard_df = pd.DataFrame(leaderboard_data.get("leaderboard", [])) if leaderboard_data else pd.DataFrame()
+print(f"✅ Leaderboard fetched: {len(leaderboard_df)} rows")
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-model = XGBClassifier(
-    n_estimators=400,
-    max_depth=6,
-    learning_rate=0.05,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    eval_metric="logloss"
-)
-model.fit(X_train, y_train)
-preds = model.predict_proba(X_test)[:,1]
-print("Validation AUC:", roc_auc_score(y_test, preds))
 
-# ========== STEP 6: PREDICT NEXT WEEK ==========
-print("Fetching next tournament field...")
-url_next = f"https://feeds.datagolf.com/preds/current?tour={TOUR}&key={API_KEY}"
-next_data = requests.get(url_next).json()
-next_week_df = pd.DataFrame(next_data["predictions"])
+# ==========================
+# STEP 4: POINTS (FedEx)
+# ==========================
+print("💯 Fetching points (FedEx)...")
+points_data = get_json("points", {"tournId": "475", "year": YEAR})
+points_df = pd.DataFrame(points_data.get("points", [])) if points_data else pd.DataFrame()
+print(f"✅ Points fetched: {len(points_df)} rows")
 
-# Predict win probability
-next_week_df["win_prob"] = model.predict_proba(next_week_df[features].fillna(0))[:,1]
-next_week_df = next_week_df.sort_values("win_prob", ascending=False)
 
-# ========== STEP 7: SAVE OUTPUT ==========
-today = datetime.date.today().isoformat()
-next_week_df.to_csv(f"predictions_{today}.csv", index=False)
-print("\nTop 10 Predicted Winners:")
-print(next_week_df[["player_name","win_prob"]].head(10))
-print("\nFull prediction saved as:", f"predictions_{today}.csv")
+# ==========================
+# STEP 5: PLAYER DETAILS (optional for each player)
+# ==========================
+def get_player_info(first_name, last_name, player_id):
+    data = get_json("players", {"firstName": first_name, "lastName": last_name, "playerId": player_id})
+    if not data:
+        return None
+    return pd.DataFrame([data])
+
+player_profiles = []
+if not leaderboard_df.empty:
+    print("🧍 Fetching player profiles...")
+    for _, row in leaderboard_df.head(10).iterrows():  # limit to top 10 to avoid API rate limits
+        pid = row.get("playerId")
+        first = row.get("firstName", "")
+        last = row.get("lastName", "")
+        p = get_player_info(first, last, pid)
+        if p is not None:
+            player_profiles.append(p)
+        time.sleep(1)
+    player_df = pd.concat(player_profiles, ignore_index=True) if player_profiles else pd.DataFrame()
+else:
+    player_df = pd.DataFrame()
+
+print(f"✅ Player profiles fetched: {len(player_df)}")
+
+
+# ==========================
+# STEP 6: MERGE ALL
+# ==========================
+print("🔗 Merging all data sources...")
+
+# Merge leaderboard + world ranking
+merged = leaderboard_df.merge(world_df, how="left", left_on="playerName", right_on="name")
+
+# Merge points
+if not points_df.empty:
+    merged = merged.merge(points_df, how="left", on="playerId")
+
+# Merge tournament info
+if not tourn_df.empty:
+    for col in tourn_df.columns:
+        merged[col] = tourn_df[col].iloc[0] if len(tourn_df) > 0 else None
+
+# Merge player profiles (if available)
+if not player_df.empty and "playerId" in player_df.columns:
+    merged = merged.merge(player_df, on="playerId", how="left")
+
+# ==========================
+# STEP 7: SAVE
+# ==========================
+merged.to_csv("golf_training_dataset.csv", index=False)
+print(f"\n✅ Combined dataset saved → golf_training_dataset.csv ({len(merged)} rows)")
+print("Columns:", merged.columns.tolist())
