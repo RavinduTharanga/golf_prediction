@@ -154,11 +154,14 @@
 #     logging.info(f"✅ Model trained | AUC: {auc:.4f} | Brier: {brier:.4f}")
 
 #     return model
+import os
 import requests, pandas as pd, time, logging
 from datetime import datetime
 from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, brier_score_loss
+from tqdm import tqdm
+
 
 # ================== CONFIG ==================
 API_KEY = "e3cf5dd42289495280baabbdecf46355"
@@ -189,9 +192,56 @@ def get_tournaments(season):
 def get_rankings(season):
     return pd.DataFrame(get_json(f"{BASE}/Rankings/{season}?key={API_KEY}"))
 
+
+
+#     return players_df
 def get_leaderboard(tournament_id):
+    """Fetch leaderboard including player + tournament info."""
     data = get_json(f"{BASE}/Leaderboard/{tournament_id}?key={API_KEY}")
-    return pd.json_normalize(data["Players"]) if "Players" in data else pd.DataFrame()
+    if not data or "Players" not in data:
+        logging.warning(f"⚠️ No player data found for tournament {tournament_id}")
+        return pd.DataFrame()
+
+    # Flatten nested structure safely
+    players_df = pd.json_normalize(
+        data["Players"],
+        sep="_"
+    )
+
+    # ✅ Handle possible nested name fields
+    name_cols = [c for c in players_df.columns if "Name" in c]
+    if "Name" in players_df.columns:
+        players_df["Name"] = players_df["Name"].astype(str)
+    elif "Player_Name" in players_df.columns:
+        players_df["Name"] = players_df["Player_Name"].astype(str)
+    elif "Player_Name_x" in players_df.columns:
+        players_df["Name"] = players_df["Player_Name_x"].astype(str)
+    elif "Player_Name_y" in players_df.columns:
+        players_df["Name"] = players_df["Player_Name_y"].astype(str)
+    elif "Player_PlayerName" in players_df.columns:
+        players_df["Name"] = players_df["Player_PlayerName"].astype(str)
+    elif len(name_cols) > 0:
+        players_df["Name"] = players_df[name_cols[0]].astype(str)
+    else:
+        players_df["Name"] = "Unknown Player"
+
+    # ✅ Tournament info
+    if "Tournament" in data and isinstance(data["Tournament"], dict):
+        tinfo = data["Tournament"]
+        for key in ["TournamentID", "Name", "StartDate", "City", "State", "Par", "Yards"]:
+            if key in tinfo:
+                players_df[f"Tournament_{key}"] = tinfo[key]
+    else:
+        players_df["Tournament_TournamentID"] = tournament_id
+
+    # 🔍 Debug: print a sample of name columns
+    sample_names = players_df["Name"].head(5).tolist()
+    logging.info(f"🎯 Sample player names from leaderboard {tournament_id}: {sample_names}")
+
+    return players_df
+
+
+
 
 def get_weather(city, date):
     """Returns average temp and wind for the tournament start day."""
@@ -220,25 +270,43 @@ def build_training_multi(years=YEARS):
     for season in years:
         tournaments = get_tournaments(season)
         rankings = get_rankings(season)
-        if tournaments.empty: continue
+        if tournaments.empty:
+            continue
+
         logging.info(f"📅 {season}: {len(tournaments)} tournaments")
 
-        for _, t in tournaments.iterrows():
+        for _, t in tqdm(tournaments.iterrows(), total=len(tournaments), desc=f"[{season}] Processing tournaments"):
             tid, name = t["TournamentID"], t["Name"]
+
+            # 🧩 Get leaderboard safely
             lb = get_leaderboard(tid)
-            if lb.empty: continue
+            if lb.empty or "PlayerID" not in lb.columns:
+                continue  # skip if no player data
 
+            # 🧩 Merge leaderboard + rankings
             df = lb.merge(rankings, how="left", on="PlayerID")
-            df["Season"] = season
-            df["TournamentID"] = tid
-            df["TournamentName"] = name
-            df["StartDate"] = t["StartDate"]
-            df["Par"] = t.get("Par")
-            df["Yards"] = t.get("Yards")
-            df["City"] = t.get("City")
-            df["State"] = t.get("State")
 
-            # result label
+            # Tournament info
+            df["Season"] = season
+            df["TournamentID"] = df.get("Tournament_TournamentID", tid)
+            df["TournamentName"] = df.get("Tournament_Name", name)
+            df["StartDate"] = df.get("Tournament_StartDate", t.get("StartDate"))
+            df["Par"] = df.get("Tournament_Par", t.get("Par"))
+            df["Yards"] = df.get("Tournament_Yards", t.get("Yards"))
+            df["City"] = df.get("Tournament_City", t.get("City"))
+            df["State"] = df.get("Tournament_State", t.get("State"))
+
+            # Player name (ensure correct field)
+            if "PlayerNameFull" in df.columns:
+                df["Name"] = df["PlayerNameFull"]
+            elif {"FirstName", "LastName"}.issubset(df.columns):
+                df["Name"] = df["FirstName"] + " " + df["LastName"]
+            elif "PlayerName" in df.columns:
+                df["Name"] = df["PlayerName"]
+            else:
+                df["Name"] = "Unknown Player"
+
+            # Label (winner flag)
             df["result_win"] = (df["Rank"] == 1).astype(int)
 
             # Weather enrichment
@@ -253,6 +321,8 @@ def build_training_multi(years=YEARS):
 
             records.append(df)
             time.sleep(0.2)
+
+    # ✅ After all tournaments processed
     if not records:
         logging.error("No tournament data collected.")
         return pd.DataFrame()
@@ -262,56 +332,131 @@ def build_training_multi(years=YEARS):
     logging.info(f"✅ Saved combined dataset: {len(all_data)} rows.")
     return all_data
 
-# ================== FEATURES ==================
+
+# # ================== FEATURES ==================
+
+# def create_features(df):
+#     logging.info("🧩 Creating enriched features...")
+
+#     df["WorldGolfRank"] = pd.to_numeric(df["WorldGolfRank"], errors="coerce")
+#     df["AveragePoints"] = pd.to_numeric(df["AveragePoints"], errors="coerce")
+#     df["Par"] = pd.to_numeric(df["Par"], errors="coerce")
+#     df["Yards"] = pd.to_numeric(df["Yards"], errors="coerce")
+#     df["AvgTemp"] = pd.to_numeric(df["AvgTemp"], errors="coerce")
+#     df["AvgWind"] = pd.to_numeric(df["AvgWind"], errors="coerce")
+
+#     # Player form features
+#     df = df.sort_values(["PlayerID", "StartDate"])
+#     df["RecentFinish"] = df.groupby("PlayerID")["Rank"].shift(1)
+#     df["AvgFinish_Last3"] = (
+#         df.groupby("PlayerID")["Rank"].transform(lambda x: x.shift(1).rolling(3).mean())
+#     )
+#     df["Top10Rate_Last5"] = (
+#         df.groupby("PlayerID")["Rank"].transform(lambda x: x.shift(1).rolling(5).apply(lambda y: (y<=10).sum()/5))
+#     )
+#     df["EventsPlayed"] = df.groupby("PlayerID").cumcount()
+
+#     df = df.fillna(0)
+#     features = [
+#         "WorldGolfRank","AveragePoints","Par","Yards","AvgTemp","AvgWind",
+#         "RecentFinish","AvgFinish_Last3","Top10Rate_Last5","EventsPlayed"
+#     ]
+
+#     # ✅ Keep tournament + player metadata for evaluation
+#     meta_cols = ["TournamentID", "TournamentName", "StartDate", "PlayerID", "Name", "Rank"]
+#     meta_cols = [c for c in meta_cols if c in df.columns]
+
+#     return df[features + ["result_win"] + meta_cols]
 def create_features(df):
     logging.info("🧩 Creating enriched features...")
 
-    df["WorldGolfRank"] = pd.to_numeric(df["WorldGolfRank"], errors="coerce")
-    df["AveragePoints"] = pd.to_numeric(df["AveragePoints"], errors="coerce")
-    df["Par"] = pd.to_numeric(df["Par"], errors="coerce")
-    df["Yards"] = pd.to_numeric(df["Yards"], errors="coerce")
-    df["AvgTemp"] = pd.to_numeric(df["AvgTemp"], errors="coerce")
-    df["AvgWind"] = pd.to_numeric(df["AvgWind"], errors="coerce")
+    # === Convert numeric columns safely ===
+    df["WorldGolfRank"] = pd.to_numeric(df.get("WorldGolfRank"), errors="coerce")
+    df["AveragePoints"] = pd.to_numeric(df.get("AveragePoints"), errors="coerce")
+    df["Par"] = pd.to_numeric(df.get("Par"), errors="coerce")
+    df["Yards"] = pd.to_numeric(df.get("Yards"), errors="coerce")
+    df["AvgTemp"] = pd.to_numeric(df.get("AvgTemp"), errors="coerce")
+    df["AvgWind"] = pd.to_numeric(df.get("AvgWind"), errors="coerce")
 
-    # Player form features
+    # === Player form features ===
     df = df.sort_values(["PlayerID", "StartDate"])
     df["RecentFinish"] = df.groupby("PlayerID")["Rank"].shift(1)
     df["AvgFinish_Last3"] = (
         df.groupby("PlayerID")["Rank"].transform(lambda x: x.shift(1).rolling(3).mean())
     )
     df["Top10Rate_Last5"] = (
-        df.groupby("PlayerID")["Rank"].transform(lambda x: x.shift(1).rolling(5).apply(lambda y: (y<=10).sum()/5))
+        df.groupby("PlayerID")["Rank"].transform(lambda x: x.shift(1).rolling(5).apply(lambda y: (y <= 10).sum() / 5))
     )
     df["EventsPlayed"] = df.groupby("PlayerID").cumcount()
 
     df = df.fillna(0)
+
     features = [
+        "WorldGolfRank", "AveragePoints", "Par", "Yards", "AvgTemp", "AvgWind",
+        "RecentFinish", "AvgFinish_Last3", "Top10Rate_Last5", "EventsPlayed"
+    ]
+
+    # === ✅ Normalize player name column for evaluation ===
+    if "Name_x" in df.columns:
+        df["Name"] = df["Name_x"].astype(str)
+    elif "Name_y" in df.columns:
+        df["Name"] = df["Name_y"].astype(str)
+    elif "PlayerName" in df.columns:
+        df["Name"] = df["PlayerName"].astype(str)
+    elif {"FirstName", "LastName"}.issubset(df.columns):
+        df["Name"] = df["FirstName"].astype(str) + " " + df["LastName"].astype(str)
+    else:
+        df["Name"] = "Unknown Player"
+
+    # === Keep tournament + player metadata ===
+    meta_cols = ["TournamentID", "TournamentName", "StartDate", "PlayerID", "Name", "Rank"]
+    meta_cols = [c for c in meta_cols if c in df.columns]
+
+    # === Return merged feature + meta data ===
+    return df[features + ["result_win"] + meta_cols]
+
+# ================== TRAIN ==================
+
+
+def train_model(df):
+    logging.info("🏋️ Training multi-year model...")
+
+    feature_cols = [
         "WorldGolfRank","AveragePoints","Par","Yards","AvgTemp","AvgWind",
         "RecentFinish","AvgFinish_Last3","Top10Rate_Last5","EventsPlayed"
     ]
-    return df[features + ["result_win"]]
 
-# ================== TRAIN ==================
-def train_model(df):
-    logging.info("🏋️ Training multi-year model...")
-    X, y = df.drop(columns="result_win"), df["result_win"]
+    X = df[feature_cols].copy()
+    y = df["result_win"]
 
-    if y.sum()==0:
+    if y.sum() == 0:
         logging.error("No winners found.")
         return None
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y)
+
     model = XGBClassifier(
-        n_estimators=700, learning_rate=0.03, max_depth=5,
-        subsample=0.9, colsample_bytree=0.9, scale_pos_weight=(len(y)-y.sum())/y.sum(),
+        n_estimators=700,
+        learning_rate=0.03,
+        max_depth=5,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        scale_pos_weight=(len(y)-y.sum())/y.sum(),
         eval_metric="logloss"
     )
-    model.fit(X_train, y_train)
-    preds = model.predict_proba(X_test)[:,1]
-    auc, brier = roc_auc_score(y_test,preds), brier_score_loss(y_test,preds)
-    logging.info(f"✅ Trained | AUC={auc:.4f}, Brier={brier:.4f}")
-    return model
 
+    model.fit(X_train, y_train)
+    preds = model.predict_proba(X_test)[:, 1]
+
+    auc = roc_auc_score(y_test, preds)
+    brier = brier_score_loss(y_test, preds)
+    logging.info(f"✅ Trained | AUC={auc:.4f}, Brier={brier:.4f}")
+
+    # 💾 Save once
+    model.save_model("golf_model.json")
+    logging.info("💾 Saved trained model to golf_model.json")
+
+    return model
 
 def predict_next_week(model):
     if model is None:
@@ -409,22 +554,124 @@ def predict_next_week(model):
 
 
 
+def evaluate_top5_accuracy(model, df):
+    """
+    Compare model's top-5 predicted players vs actual top-5 per tournament.
+    Saves readable summary CSV with tournament name + start date + actual winner.
+    """
+    summary = []
+    tournaments = df["TournamentID"].unique()
+    total = 0
+    hit_tournaments = 0
+    total_overlap = 0
+
+    # ✅ Match same feature columns used during training
+    feature_cols = [
+        "WorldGolfRank", "AveragePoints", "Par", "Yards", "AvgTemp", "AvgWind",
+        "RecentFinish", "AvgFinish_Last3", "Top10Rate_Last5", "EventsPlayed"
+    ]
+
+    for tid in tournaments:
+        subset = df[df["TournamentID"] == tid].copy()
+        if subset.empty or "Rank" not in subset.columns:
+            continue
+
+        # ✅ Robust name detection (handles Name_x, Name_y, PlayerName, etc.)
+        name_cols = [c for c in subset.columns if "Name" in c and "Tournament" not in c]
+        if len(name_cols) > 0:
+            # Prefer Name_x (leaderboard), fallback to next
+            preferred = "Name_x" if "Name_x" in name_cols else name_cols[0]
+            subset["Name"] = subset[preferred].astype(str)
+        else:
+            subset["Name"] = "Unknown Player"
+
+        # ✅ Only numeric features for prediction
+        X = subset[feature_cols].fillna(0)
+        preds = model.predict_proba(X)[:, 1]
+        subset["pred_score"] = preds
+
+        tname = subset["TournamentName"].iloc[0] if "TournamentName" in subset.columns else f"Tournament {tid}"
+        tdate = subset["StartDate"].iloc[0] if "StartDate" in subset.columns else None
+
+        # ✅ Identify top predicted and actual players
+        top_pred = subset.sort_values("pred_score", ascending=False).head(5)["Name"].tolist()
+        actual_top5 = subset.sort_values("Rank", ascending=True).head(5)["Name"].tolist()
+        actual_winner = subset.loc[subset["Rank"].idxmin(), "Name"]
+
+        # ✅ Compare overlap
+        overlap = len(set(top_pred).intersection(set(actual_top5)))
+        total_overlap += overlap
+        total += 1
+        if overlap > 0:
+            hit_tournaments += 1
+
+        summary.append({
+            "TournamentName": tname,
+            "StartDate": tdate,
+            "PredictedTop5": ", ".join(top_pred),
+            "ActualTop5": ", ".join(actual_top5),
+            "ActualWinner": actual_winner,
+            "OverlapCount": overlap
+        })
+
+    # ✅ Compute global metrics
+    top5_hit_rate = hit_tournaments / total if total else 0
+    avg_overlap = total_overlap / total if total else 0
+
+    # ✅ Save summary
+    summary_df = pd.DataFrame(summary)
+    summary_df.to_csv("top5_tournament_summary.csv", index=False)
+    logging.info("💾 Saved Top-5 summary to top5_tournament_summary.csv")
+    logging.info(f"🏆 Top-5 inclusion accuracy: {top5_hit_rate*100:.2f}% ({hit_tournaments}/{total}) tournaments")
+    logging.info(f"📊 Avg overlap per tournament: {avg_overlap:.2f}")
+
+    return summary_df
+
+
 
 # ================== MAIN RUN ==================
 if __name__ == "__main__":
-    logging.info("🚀 Starting Golf Prediction Pipeline (Multi-Year Mode)...")
-    df = build_training_multi(YEARS)
+    import os
 
+    logging.info("🚀 Starting Golf Prediction Pipeline (Evaluation + Next Week Prediction)...")
 
-    if not df.empty:
-        feats = create_features(df)
-        model = train_model(feats)
-        preds = predict_next_week(model)
-
-        if not preds.empty:
-            logging.info("🏆 Top 10 Predicted Winners:")
-            print(preds.head(10))
-        else:
-            logging.warning("⚠️ No predictions available.")
+    # === Step 1: Load saved model or train if missing ===
+    if os.path.exists("golf_model.json"):
+        logging.info("📂 Loading saved model from golf_model.json...")
+        model = XGBClassifier()
+        model.load_model("golf_model.json")
     else:
-        logging.error("❌ Pipeline stopped: No data collected.")
+        logging.info("🧩 No saved model found — building dataset and training model...")
+        df = build_training_multi(YEARS)
+        if not df.empty:
+            feats = create_features(df)
+            model = train_model(feats)
+            model.save_model("golf_model.json")
+            logging.info("💾 Saved trained model to golf_model.json")
+        else:
+            logging.error("❌ No data available. Exiting.")
+            exit()
+
+    # === Step 2: Evaluate top-5 accuracy using past tournaments ===
+    if os.path.exists("golf_training_multi_year.csv"):
+        logging.info("📂 Loading existing dataset for evaluation...")
+        df = pd.read_csv("golf_training_multi_year.csv")
+    else:
+        logging.info("⚙️ Building dataset for evaluation...")
+        df = build_training_multi(YEARS)
+        df.to_csv("golf_training_multi_year.csv", index=False)
+
+    feats = create_features(df)
+    evaluate_top5_accuracy(model, feats)
+
+    # === Step 3: Predict next week's tournament ===
+    preds = predict_next_week(model)
+
+    if not preds.empty:
+        top5 = preds.head(5)
+        logging.info("🏆 Next-week Top-5 Predicted Winners:")
+        print(top5.to_string(index=False))
+        top5.to_csv("top5_next_week.csv", index=False)
+        logging.info("💾 Saved Top-5 next-week predictions to top5_next_week.csv")
+    else:
+        logging.warning("⚠️ No predictions available.")
